@@ -1,0 +1,10 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mshv-bindings = { path = "../../../mshv/mshv-bindings" }
+mshv-ioctls = { path = "../../../mshv/mshv-ioctls" }
+libc = { version = "0.2.148" }
+x86 = "0.52.0"
