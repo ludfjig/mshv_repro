@@ -10,4 +10,4 @@ panic = "abort"
 panic = "abort"
 
 [dependencies]
-
+compiler_builtins = {version = "0.1.113", features = ["no-f16-f128", "mem"]}

@@ -3,5 +3,14 @@
 version = 3
 
 [[package]]
+name = "compiler_builtins"
+version = "0.1.113"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7a6025b8e1885a239509ec7a00859e721eecb5725a64206ab1a6a96f7b55660"
+
+[[package]]
 name = "guest"
 version = "0.1.0"
+dependencies = [
+ "compiler_builtins",
+]

@@ -1,2 +1,15 @@
-[target.'cfg(target_os = "linux")']
-rustflags = ["-C", "link-arg=-nostartfiles"]
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C", 
+  "link-args=/RELEASE /DEBUG /NOLOGO /NXCOMPAT /SAFESEH:NO /ENTRY:entrypoint /SUBSYSTEM:NATIVE /ALIGN:4096 /FILEALIGN:4096 /NODEFAULTLIB /HEAP:131072,131072 /DYNAMICBASE /STACK:65536,65536 /MACHINE:X64",
+]
+linker = "rust-lld"
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

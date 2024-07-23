@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use libc::{mmap, munmap};
+use libc::{memrchr, mmap, munmap};
 use mshv_bindings::{
     hv_message, hv_message_type_HVMSG_UNMAPPED_GPA, hv_message_type_HVMSG_UNRECOVERABLE_EXCEPTION,
     hv_message_type_HVMSG_X64_HALT, hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT,
@@ -23,9 +23,9 @@ const EFER_LME: u64 = 1 << 8;
 const EFER_LMA: u64 = 1 << 10;
 
 fn main() {
+    let mut failures = vec![];
     // RUN
-    for memory_size in (750 * PAGE_SIZE..800 * PAGE_SIZE).step_by(PAGE_SIZE) {
-        println!("Memory size (pages): {}", memory_size / PAGE_SIZE);
+    for memory_size in (550 * PAGE_SIZE..850 * PAGE_SIZE).step_by(PAGE_SIZE) {
         // setup memory
         let memory_arena_raw = setup_memory_arena(memory_size);
         let memory_arena = unsafe { std::slice::from_raw_parts_mut(memory_arena_raw, memory_size) };
@@ -45,25 +45,33 @@ fn main() {
         .unwrap();
 
         // write binary code to memory
-        let code = include_bytes!("../../guest/target/debug/guest");
+        // let code = include_bytes!("../../guest/target/debug/guest");
+        let code = include_bytes!("../../guest/target/x86_64-pc-windows-msvc/debug/guest.exe");
+        let entrypoint_offset = get_guest_binary_entrypoint_offset(code);
         memory_arena[CODE_OFFSET..CODE_OFFSET + code.len()].copy_from_slice(code);
+        let output_offset = (CODE_OFFSET + code.len()).next_multiple_of(PAGE_SIZE);
 
-        // Run the same code a couple of times
-        for i in 0..500 {
-            // clear dirty pages, setup testing
-            let base_snapshot = memory_arena.to_vec();
-            get_and_clear_dirty_pages(memory_size, &vm);
-            let entrypoint_offset = get_guest_binary_entrypoint_offset();
+        // Run entrypoint fn in guest
+        let mut regs = vcpu.get_regs().unwrap();
+        regs.rip = (GUEST_PHYSICAL_ADDR_BASE + CODE_OFFSET + entrypoint_offset) as u64;
+        regs.rsp = (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64;
+        regs.rcx = (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64; // first parameter output buffer
+        regs.rflags = 0x2;
+        vcpu.set_regs(&regs).unwrap();
+        drop(memory_arena);
+        execute_until_halt(&mut vcpu);
+        get_and_clear_dirty_pages(memory_size, &vm);
 
+        // get result from entrypoint fn (written to output buffer)
+        let dispatch_fn_addr = unsafe { (memory_arena_raw.add(output_offset) as *mut u64).read() };
+
+        // Run the `dispatch_function` couple of times
+        for i in 0..1000 {
             let mut regs = vcpu.get_regs().unwrap();
-            regs.rip = (GUEST_PHYSICAL_ADDR_BASE + CODE_OFFSET + entrypoint_offset) as u64;
+            regs.rip = dispatch_fn_addr;
             regs.rsp = (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64;
-            let output_offset = (CODE_OFFSET + code.len()).next_multiple_of(PAGE_SIZE);
-            regs.rdi = (output_offset + GUEST_PHYSICAL_ADDR_BASE) as u64; // first parameter output buffer
             regs.rflags = 0x2;
             vcpu.set_regs(&regs).unwrap();
-
-            // Run the vcpu until HLT
             execute_until_halt(&mut vcpu);
 
             let pages = get_and_clear_dirty_pages(memory_size, &vm);
@@ -72,24 +80,32 @@ fn main() {
             let last_page_bit_idx = last_page_idx % 64;
 
             let num_dirty_pages = pages.iter().map(|block| block.count_ones()).sum::<u32>();
+            print!(
+                "\rMemory size: {:#x}, dirty pages: {}",
+                memory_size, num_dirty_pages
+            );
+            assert_eq!(num_dirty_pages, 4);
 
             let top_of_stack_dirty = pages[last_block_idx] & (1 << last_page_bit_idx) != 0;
-            assert!(top_of_stack_dirty);
-
-            // read result from guest executing
-            let result: u64 = unsafe { (memory_arena_raw.add(output_offset) as *mut u64).read() };
-            print!(
-                "\riteration {i}, Guest result: {}, #dirty pages: {}",
-                result, num_dirty_pages
-            );
+            if !top_of_stack_dirty {
+                failures.push((memory_size, i));
+            }
 
             // restore memory
-            unsafe { core::ptr::copy(base_snapshot.as_ptr(), memory_arena_raw, memory_size) };
-            // memory_arena_raw.copy_from_slice(&base_snapshot);
+            // unsafe { core::ptr::copy(base_snapshot.as_ptr(), memory_arena_raw, memory_size) };
         }
         unsafe { munmap(memory_arena_raw as *mut libc::c_void, memory_size) };
         println!();
     }
+    for (memory_size, i) in &failures {
+        println!(
+            "Stack not marked dirty for memory size: {:#x} ({} pages), iteration: {}",
+            memory_size,
+            memory_size / PAGE_SIZE,
+            i
+        );
+    }
+    assert!(failures.is_empty())
 }
 
 #[allow(non_upper_case_globals)]
@@ -213,28 +229,31 @@ fn get_and_clear_dirty_pages(memory_size: usize, vm: &VmFd) -> Vec<u64> {
     dirty_pages
 }
 
-fn get_guest_binary_entrypoint_offset() -> usize {
-    let objdump = Command::new("objdump")
-        .args(&["-d", "crates/guest/target/debug/guest"])
-        .output()
-        .expect(
-            "failed to execute objdump. Did you compile the guest first, and is objdump installed?",
-        );
-    let objdump_str =
-        String::from_utf8(objdump.stdout).expect("Failed to convert objdump output to string");
-    let entrypoint_line = objdump_str
-        .lines()
-        .find(|&line| line.contains("<_start>:"))
-        .expect("Failed to find entrypoint in objdump output");
+fn get_guest_binary_entrypoint_offset(code: &[u8]) -> usize {
+    // let objdump = Command::new("objdump")
+    //     .args(&["-d", "crates/guest/target/debug/guest"])
+    //     .output()
+    //     .expect(
+    //         "failed to execute objdump. Did you compile the guest first, and is objdump installed?",
+    //     );
+    let offset = goblin::pe::PE::parse(code).unwrap().entry;
+    // println!("entrypoint: {}", offset);
+    // let objdump_str =
+    //     String::from_utf8(objdump.stdout).expect("Failed to convert objdump output to string");
+    // let entrypoint_line = objdump_str
+    //     .lines()
+    //     .find(|&line| line.contains("<_start>:"))
+    //     .expect("Failed to find entrypoint in objdump output");
 
-    let entrypoint_line = entrypoint_line
-        .split_whitespace()
-        .nth(0)
-        .expect("Failed to find entrypoint in objdump output");
+    // let entrypoint_line = entrypoint_line
+    //     .split_whitespace()
+    //     .nth(0)
+    //     .expect("Failed to find entrypoint in objdump output");
 
-    let offset = usize::from_str_radix(entrypoint_line, 16)
-        .expect("Failed to parse entrypoint offset as usize");
-    // println!("Entrypoint offset: {:#x}", offset);
+    // let offset = usize::from_str_radix(entrypoint_line, 16)
+    //     .expect("Failed to parse entrypoint offset as usize");
+    // // println!("Entrypoint offset: {:#x}", offset);
+    // offset
     offset
 }
 

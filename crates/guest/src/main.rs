@@ -4,12 +4,15 @@
 use core::arch::asm;
 
 #[no_mangle]
-pub unsafe extern "C" fn _start(_output_ptr: u64) -> ! {
-    // let output_ptr = output_ptr as *mut u64;
-    // result will be in rax
-    // out(5, 4);
-    let _res = fib(13);
-    // output_ptr.write(res);
+pub unsafe extern "C" fn entrypoint(output_ptr: *mut u64) -> ! {
+    output_ptr.write(dispatch_function as u64);
+    asm!("hlt");
+    unreachable!()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn dispatch_function() -> ! {
+    let res = fib(10);
     asm!("hlt");
     unreachable!()
 }
@@ -28,18 +31,24 @@ fn fib(i: u64) -> u64 {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    out(5, 5); // some random nums to detect panic
+    out(5, 2147000000); // some random nums to detect panic
     loop {}
 }
 
 // writes value to port
-fn out(port: u16, value: u16) {
+fn out(port: u16, value: u32) {
     unsafe {
         asm!(
-            "out dx, ax",
+            "out dx, eax",
             in("dx") port,
-            in("ax") value,
+            in("eax") value,
             options(nomem, nostack, preserves_flags)
         );
     }
 }
+
+#[no_mangle]
+pub extern "C" fn __CxxFrameHandler3() {}
+
+#[no_mangle]
+pub extern "C" fn _fltused() {}
