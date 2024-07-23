@@ -1,4 +1,3 @@
-# Build the guest binary and get binary entrypoint offset
+First you need to point `crates/host/Cargo.toml` mshv dependencies to your local repos. Then run
 
-`cd crates/guest && cargo build && objdump -d target/debug/guest | grep _start -m 1 | awk '{printf "0x%x\n", strtonum("0x"$1)}'`
-and note the output
+`just run` to both build guest, and run host
