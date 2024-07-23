@@ -4,7 +4,8 @@
 use core::arch::asm;
 
 #[no_mangle]
-pub unsafe extern "C" fn entrypoint(output_ptr: *mut u64) -> ! {
+pub unsafe extern "C" fn entrypoint(output_ptr: u64) -> ! {
+    let output_ptr = output_ptr as *mut u64;
     output_ptr.write(dispatch_function as u64);
     asm!("hlt");
     unreachable!()
@@ -47,8 +48,8 @@ fn out(port: u16, value: u32) {
     }
 }
 
+// Unresolved symbols
 #[no_mangle]
-pub extern "C" fn __CxxFrameHandler3() {}
-
+pub(crate) extern "C" fn __CxxFrameHandler3() {}
 #[no_mangle]
-pub extern "C" fn _fltused() {}
+pub(crate) static _fltused: i32 = 0;

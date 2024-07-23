@@ -58,9 +58,10 @@ fn main() {
         regs.rcx = (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64; // first parameter output buffer
         regs.rflags = 0x2;
         vcpu.set_regs(&regs).unwrap();
-        drop(memory_arena);
         execute_until_halt(&mut vcpu);
         get_and_clear_dirty_pages(memory_size, &vm);
+
+        let base_snapshot = memory_arena.to_vec();
 
         // get result from entrypoint fn (written to output buffer)
         let dispatch_fn_addr = unsafe { (memory_arena_raw.add(output_offset) as *mut u64).read() };
@@ -74,25 +75,32 @@ fn main() {
             vcpu.set_regs(&regs).unwrap();
             execute_until_halt(&mut vcpu);
 
-            let pages = get_and_clear_dirty_pages(memory_size, &vm);
+            let bitmaps = get_and_clear_dirty_pages(memory_size, &vm);
             let last_page_idx = memory_size / PAGE_SIZE - 1;
             let last_block_idx = last_page_idx / 64;
             let last_page_bit_idx = last_page_idx % 64;
 
-            let num_dirty_pages = pages.iter().map(|block| block.count_ones()).sum::<u32>();
-            print!(
-                "\rMemory size: {:#x}, dirty pages: {}",
-                memory_size, num_dirty_pages
-            );
+            let num_dirty_pages = bitmaps.iter().map(|block| block.count_ones()).sum::<u32>();
             assert_eq!(num_dirty_pages, 4);
 
-            let top_of_stack_dirty = pages[last_block_idx] & (1 << last_page_bit_idx) != 0;
+            let top_of_stack_dirty =
+                bitmaps[last_block_idx] & (1 << last_page_bit_idx) == 1 << last_page_bit_idx;
+            assert!(top_of_stack_dirty);
             if !top_of_stack_dirty {
                 failures.push((memory_size, i));
             }
+            if i == 0 {
+                println!(
+                    "Memory size: {:#x}, dirty pages: {}",
+                    memory_size, num_dirty_pages
+                );
+                for (l, block) in bitmaps.iter().enumerate() {
+                    println!("block idx {:2}: {:064b}", l, block);
+                }
+            }
 
             // restore memory
-            // unsafe { core::ptr::copy(base_snapshot.as_ptr(), memory_arena_raw, memory_size) };
+            unsafe { core::ptr::copy(base_snapshot.as_ptr(), memory_arena_raw, memory_size) };
         }
         unsafe { munmap(memory_arena_raw as *mut libc::c_void, memory_size) };
         println!();
