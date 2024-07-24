@@ -4,7 +4,8 @@ use libc::{memrchr, mmap, munmap};
 use mshv_bindings::{
     hv_message, hv_message_type_HVMSG_UNMAPPED_GPA, hv_message_type_HVMSG_UNRECOVERABLE_EXCEPTION,
     hv_message_type_HVMSG_X64_HALT, hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT,
-    mshv_user_mem_region, HV_MAP_GPA_EXECUTABLE, HV_MAP_GPA_READABLE, HV_MAP_GPA_WRITABLE,
+    mshv_user_mem_region, StandardRegisters, HV_MAP_GPA_EXECUTABLE, HV_MAP_GPA_READABLE,
+    HV_MAP_GPA_WRITABLE,
 };
 use mshv_ioctls::{Mshv, VcpuFd, VmFd};
 use x86::bits64::paging::{PAddr, PDEntry, PDFlags, PDPTEntry, PDPTFlags, PML4Entry, PML4Flags};
@@ -52,15 +53,19 @@ fn main() {
         let output_offset = (CODE_OFFSET + code.len()).next_multiple_of(PAGE_SIZE);
 
         // Run entrypoint fn in guest
-        let mut regs = vcpu.get_regs().unwrap();
-        regs.rip = (GUEST_PHYSICAL_ADDR_BASE + CODE_OFFSET + entrypoint_offset) as u64;
-        regs.rsp = (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64;
-        regs.rcx = (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64; // first parameter output buffer
-        regs.rflags = 0x2;
+        let regs = StandardRegisters {
+            rip: (GUEST_PHYSICAL_ADDR_BASE + CODE_OFFSET + entrypoint_offset) as u64,
+            rsp: (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64,
+            rcx: (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64, // first parameter output buffer
+            rflags: 0x2,
+            ..Default::default()
+        };
         vcpu.set_regs(&regs).unwrap();
         execute_until_halt(&mut vcpu);
         get_and_clear_dirty_pages(memory_size, &vm);
 
+        // this is UB because the memory behind memory_arena has modified by the guest. Rust documentation requires it to only be modified through
+        // the memory_arena reference itself. But whatever, we are hacking here anyway.
         let base_snapshot = memory_arena.to_vec();
 
         // get result from entrypoint fn (written to output buffer)
