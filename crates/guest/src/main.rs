@@ -13,26 +13,15 @@ pub unsafe extern "C" fn entrypoint(output_ptr: u64) -> ! {
 
 #[no_mangle]
 pub unsafe extern "C" fn dispatch_function() -> ! {
-    let res = fib(10);
+    let _dirty = 11; // the stack will be dirtied because this value will be written to stack (in debug mode). It is optimized away in release mode
     asm!("hlt");
     unreachable!()
-}
-
-// prevent inlining
-#[no_mangle]
-#[inline(never)]
-fn fib(i: u64) -> u64 {
-    match i {
-        0 => 0,
-        1 => 1,
-        _ => fib(i - 1) + fib(i - 2),
-    }
 }
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    out(5, 2147000000); // some random nums to detect panic
+    out(5, 2147000000); // a random num to detect panic
     loop {}
 }
 
