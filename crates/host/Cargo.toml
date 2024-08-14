@@ -12,3 +12,6 @@ goblin = { version = "0.8" }
 
 [features]
 bug = [] # manifests bug
+
+[profile.release]
+debug = true

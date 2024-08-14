@@ -1,3 +1,7 @@
+use std::alloc::Layout;
+use std::collections::HashMap;
+use std::vec;
+
 use libc::{mmap, munmap};
 use mshv_bindings::{
     hv_message, hv_message_type_HVMSG_UNMAPPED_GPA, hv_message_type_HVMSG_UNRECOVERABLE_EXCEPTION,
@@ -23,14 +27,15 @@ const EFER_LMA: u64 = 1 << 10;
 
 fn main() {
     let mut num_fails = 0;
+    let mut failed_sizes = HashMap::new();
+
     for memory_size in (250 * PAGE_SIZE..300 * PAGE_SIZE).step_by(PAGE_SIZE) {
         let mut failed = false;
         println!("Memory size: {:#x}", memory_size);
 
         // setup memory
         let memory_arena_raw = setup_memory_arena(memory_size);
-        let memory_arena = unsafe { std::slice::from_raw_parts_mut(memory_arena_raw, memory_size) };
-        setup_page_tables(memory_arena);
+        setup_page_tables(memory_arena_raw as *mut u64);
 
         // create vm and vcpu
         let (vm, mut vcpu) = create_vm();
@@ -40,7 +45,7 @@ fn main() {
         vm.map_user_memory(mshv_user_mem_region {
             guest_pfn: GUEST_PFN_BASE as u64,
             size: memory_size as u64,
-            userspace_addr: memory_arena.as_ptr() as u64,
+            userspace_addr: memory_arena_raw as u64,
             flags: HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE | HV_MAP_GPA_EXECUTABLE,
         })
         .unwrap();
@@ -48,7 +53,13 @@ fn main() {
         // write guest binary to memory
         let code = include_bytes!("../../guest/target/x86_64-pc-windows-msvc/debug/guest.exe");
         let entrypoint_offset = get_guest_binary_entrypoint_offset(code);
-        memory_arena[CODE_OFFSET..CODE_OFFSET + code.len()].copy_from_slice(code);
+        unsafe {
+            std::ptr::copy(
+                code.as_ptr(),
+                memory_arena_raw.byte_add(CODE_OFFSET),
+                code.len(),
+            );
+        }
         let output_offset = (CODE_OFFSET + code.len()).next_multiple_of(PAGE_SIZE);
 
         // Run entrypoint fn in guest
@@ -63,18 +74,17 @@ fn main() {
         execute_until_halt(&mut vcpu);
         get_and_clear_dirty_pages(memory_size, &vm);
 
-        // this is UB because the memory behind memory_arena has modified by the guest. Rust documentation requires it to only be modified through
-        // the memory_arena reference itself. But whatever, we are hacking here anyway.
-        let base_snapshot = unsafe {
-            // need to get a new reference, otherwise it's UB in rust, since you are not allowed to modify a slice behind a reference
-            std::slice::from_raw_parts_mut(memory_arena_raw, memory_size).to_vec()
-        };
+        // take snapshot after entrypoint is ran
+        let base_snapshot =
+            unsafe { std::slice::from_raw_parts(memory_arena_raw, memory_size).to_vec() };
 
         // get result from entrypoint fn (written to output buffer)
-        let dispatch_fn_addr = unsafe { (memory_arena_raw.add(output_offset) as *mut u64).read() };
+        let dispatch_fn_addr =
+            unsafe { (memory_arena_raw.byte_add(output_offset) as *mut u64).read() };
 
-        #[cfg(feature = "bug")]
-        let mut bitmaps = vec![];
+        #[allow(unused_variables, unused_mut)]
+        // let mut bitmaps: Vec<Vec<u64>> = vec::Vec::with_capacity(200);
+        let mut bitmaps: Vec<Vec<u64>> = vec![];
 
         // Run the `dispatch_function` couple of times
         for i in 0..500 {
@@ -97,8 +107,7 @@ fn main() {
             // get the data of the last page
             let last_page_before_run = base_snapshot[last_page_idx * PAGE_SIZE..].to_vec();
             let last_page_after_run = unsafe {
-                // need to get a new reference, otherwise it's UB in rust, since you are not allowed to modify a slice behind a reference
-                std::slice::from_raw_parts_mut(memory_arena_raw, memory_size)
+                std::slice::from_raw_parts(memory_arena_raw, memory_size)
                     [last_page_idx * PAGE_SIZE..]
                     .to_vec()
             };
@@ -111,6 +120,10 @@ fn main() {
             if !top_of_stack_dirty && last_page_before_run != last_page_after_run {
                 // If we get here, the page was changed, but the dirty bit was not set
                 num_fails += 1;
+                failed_sizes.insert(
+                    memory_size,
+                    failed_sizes.get(&memory_size).unwrap_or(&0) + 1,
+                );
                 failed = true;
                 // check differing byte
                 for k in 0..last_page_before_run.len() {
@@ -132,10 +145,13 @@ fn main() {
                 }
             }
             #[cfg(feature = "bug")]
-            bitmaps.push(bitmap);
+            {
+                bitmaps.push(vec![0, 1, 4, 5, 4]);
+            }
 
             // restore memory and clear flags after
             unsafe { core::ptr::copy(base_snapshot.as_ptr(), memory_arena_raw, memory_size) };
+            assert_eq!(base_snapshot.len(), memory_size);
             get_and_clear_dirty_pages(memory_size, &vm);
         }
         if failed {
@@ -149,7 +165,8 @@ fn main() {
 
     assert_eq!(
         num_fails, 0,
-        "Stack was not marked dirty {num_fails} times when it should have been"
+        "Stack was not marked dirty {num_fails} times when it should have been. Failed with the following memory-sizes, the given number of times each: {:#x?}",
+        failed_sizes
     );
 }
 
@@ -213,6 +230,8 @@ fn setup_memory_arena(memory_size: usize) -> *mut u8 {
             -1,
             0,
         ) as *mut u8
+        // let layout = Layout::from_size_align(memory_size, PAGE_SIZE).unwrap();
+        // std::alloc::alloc_zeroed(layout) as *mut u8
     }
 }
 
@@ -238,7 +257,7 @@ fn setup_initial_sregs(vcpu: &mut VcpuFd) {
     vcpu.set_sregs(&sregs).unwrap();
 }
 
-fn setup_page_tables(memory_arena: &mut [u8]) {
+fn setup_page_tables(memory_arena: *mut u64) {
     // Physical Guest Memory layout:
     // -----------------
     // 0x0000000 - 0x20_0000: Unmapped
@@ -253,16 +272,16 @@ fn setup_page_tables(memory_arena: &mut [u8]) {
 
     // Create PML4 table with only 1 PML4 entry
     let pml4e = PML4Entry::new(pdpt_addr, PML4Flags::P | PML4Flags::RW);
-    memory_arena[..8].copy_from_slice(&pml4e.0.to_le_bytes());
+    unsafe { memory_arena.write(pml4e.0) };
 
     // Create PDPT with only 1 PDPT entry
     let pdpte = PDPTEntry::new(pd_addr, PDPTFlags::P | PDPTFlags::RW);
-    memory_arena[0x1000..0x1000 + 8].copy_from_slice(&pdpte.0.to_le_bytes());
+    unsafe { memory_arena.byte_add(0x1000).write(pdpte.0) };
 
     // Create 1 PD table with only 512 PD entries
     for i in 0..512 {
         let pde = PDEntry::new(PAddr::from(i << 21), PDFlags::P | PDFlags::RW | PDFlags::PS); // 2 MB pages
-        memory_arena[0x2000 + i * 8..0x2000 + i * 8 + 8].copy_from_slice(&pde.0.to_le_bytes());
+        unsafe { memory_arena.byte_add(0x2000 + i * 8).write(pde.0) };
     }
 }
 
