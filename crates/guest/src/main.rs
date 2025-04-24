@@ -36,9 +36,3 @@ fn out(port: u16, value: u32) {
         );
     }
 }
-
-// Unresolved symbols
-#[no_mangle]
-pub(crate) extern "C" fn __CxxFrameHandler3() {}
-#[no_mangle]
-pub(crate) static _fltused: i32 = 0;
