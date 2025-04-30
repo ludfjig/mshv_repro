@@ -1,8 +1,16 @@
 use std::alloc::Layout;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::vec;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use std::{thread, vec};
 
-use libc::{mmap, munmap};
+mod kvm;
+mod shared;
+
+use kvm::{create_vm, setup_initial_sregs};
+use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
+use libc::{mmap, munmap, SIGUSR1};
 use mshv_bindings::{
     hv_message, hv_message_type_HVMSG_UNMAPPED_GPA, hv_message_type_HVMSG_UNRECOVERABLE_EXCEPTION,
     hv_message_type_HVMSG_X64_HALT, hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT,
@@ -10,6 +18,7 @@ use mshv_bindings::{
     HV_MAP_GPA_WRITABLE,
 };
 use mshv_ioctls::{Mshv, VcpuFd, VmFd};
+use shared::{Registers, Vm};
 use x86::bits64::paging::{PAddr, PDEntry, PDFlags, PDPTEntry, PDPTFlags, PML4Entry, PML4Flags};
 use x86::controlregs::Cr0;
 use x86::controlregs::Cr4;
@@ -33,17 +42,16 @@ fn main() {
     setup_page_tables(memory_arena_raw as *mut u64);
 
     // create vm and vcpu
-    let (vm, mut vcpu) = create_vm();
-    setup_initial_sregs(&mut vcpu);
+    let mut vm = create_vm();
+    setup_initial_sregs(&mut vm as &mut dyn Vm);
 
-    // map memory into vm
-    vm.map_user_memory(mshv_user_mem_region {
-        guest_pfn: GUEST_PFN_BASE as u64,
-        size: memory_size as u64,
+    vm.map_memory(kvm_bindings::kvm_userspace_memory_region {
+        slot: 0,
+        flags: 0,
+        guest_phys_addr: 0x200_000,
+        memory_size: memory_size as u64,
         userspace_addr: memory_arena_raw as u64,
-        flags: HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE | HV_MAP_GPA_EXECUTABLE,
-    })
-    .unwrap();
+    });
 
     // write guest binary to memory
     let code = include_bytes!("../../guest/target/x86_64-unknown-none/debug/guest");
@@ -58,89 +66,46 @@ fn main() {
     let output_offset = (CODE_OFFSET + code.len()).next_multiple_of(PAGE_SIZE);
 
     // Run entrypoint fn in guest
-    let regs = StandardRegisters {
+    let regs = Registers {
         rip: (GUEST_PHYSICAL_ADDR_BASE + CODE_OFFSET + entrypoint_offset) as u64,
         rsp: (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64,
-        rcx: (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64, // first parameter output buffer
+        rdi: (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64, // first parameter output buffer
         rflags: 0x2,
         ..Default::default()
     };
-    vcpu.set_regs(&regs).unwrap();
-    execute_until_halt(&mut vcpu);
-    get_and_clear_dirty_pages(memory_size, &vm);
-
-    // take snapshot after entrypoint is ran
-    let base_snapshot =
-        unsafe { std::slice::from_raw_parts(memory_arena_raw, memory_size).to_vec() };
+    vm.set_regs(&regs);
+    vm.run();
 
     // get result from entrypoint fn (written to output buffer)
     let dispatch_fn_addr = unsafe { (memory_arena_raw.byte_add(output_offset) as *mut u64).read() };
 
-    #[allow(unused_variables, unused_mut)]
-    // let mut bitmaps: Vec<Vec<u64>> = vec::Vec::with_capacity(200);
-    let mut bitmaps: Vec<Vec<u64>> = vec![];
-
     // set regs
-    let mut regs = vcpu.get_regs().unwrap();
+    let mut regs = vm.regs();
     regs.rip = dispatch_fn_addr;
     regs.rsp = (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64;
     regs.rflags = 0x2;
-    vcpu.set_regs(&regs).unwrap();
+    vm.set_regs(&regs);
 
-    // run
-    execute_until_halt(&mut vcpu);
+    unsafe {
+        libc::signal(libc::SIGUSR1, handle_sigusr1 as usize);
+    }
+    let handle = vm.interrupt_handle();
 
-    unsafe { munmap(memory_arena_raw as *mut libc::c_void, memory_size) };
+    // Kill the blocking vm after 3 secs
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(3));
+        handle.kill().unwrap();
+    });
+
+    // runs forever
+    println!("Entering infinite loop in guest...");
+    vm.run();
+
+    println!("IT WORKED");
 }
 
-#[allow(non_upper_case_globals)]
-fn execute_until_halt(vcpu: &mut VcpuFd) {
-    // Run CPU until halt
-    loop {
-        let hv_message: hv_message = unsafe { std::mem::zeroed() };
-        match vcpu.run(hv_message) {
-            Ok(m) => match m.header.message_type {
-                hv_message_type_HVMSG_X64_HALT => {
-                    // println!("Vcpu halted");
-                    break;
-                }
-                hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT => {
-                    let io = m.to_ioport_info().unwrap();
-                    let port = io.port_number;
-                    let val = io.rax;
-                    let mut regs = vcpu.get_regs().unwrap();
-                    regs.rip += 1;
-                    vcpu.set_regs(&regs).unwrap();
-                    println!("io port intercept on port {}, with value: {}", port, val);
-                }
-                hv_message_type_HVMSG_UNMAPPED_GPA => {
-                    let mimo_message = m.to_memory_info().unwrap();
-                    let paddr = mimo_message.guest_physical_address;
-                    let vaddr = mimo_message.guest_virtual_address;
-                    let rip = mimo_message.header.rip;
-                    println!(
-                        "Unmapped gpa! paddr: {:#x} vaddr: {:#x}, rip: {:#x}",
-                        paddr, vaddr, rip
-                    );
-                    break;
-                }
-                hv_message_type_HVMSG_UNRECOVERABLE_EXCEPTION => {
-                    let msg = m.to_unrecoverable_exception_info().unwrap();
-                    let rip = msg.header.rip;
-                    println!("Unrecoverable exception: rip: {:#x}", rip);
-                    break;
-                }
-                unknown => {
-                    println!("Unknown exit reason {unknown}");
-                    break;
-                }
-            },
-            Err(e) => {
-                println!("Error: {:?}", e);
-                break;
-            }
-        }
-    }
+extern "C" fn handle_sigusr1(_: libc::c_int) {
+    println!("Received SIGUSR1!");
 }
 
 fn setup_memory_arena(memory_size: usize) -> *mut u8 {
@@ -156,28 +121,6 @@ fn setup_memory_arena(memory_size: usize) -> *mut u8 {
         // let layout = Layout::from_size_align(memory_size, PAGE_SIZE).unwrap();
         // std::alloc::alloc_zeroed(layout) as *mut u8
     }
-}
-
-fn setup_initial_sregs(vcpu: &mut VcpuFd) {
-    let mut sregs = vcpu.get_sregs().unwrap();
-    sregs.cs.base = 0;
-    sregs.cs.l = 1;
-    sregs.cs.s = 1;
-    sregs.cs.present = 1;
-    sregs.cs.selector = 0;
-
-    sregs.efer = EFER_LME | EFER_LMA;
-    sregs.cr3 = GUEST_PHYSICAL_ADDR_BASE as u64;
-    sregs.cr4 = (Cr4::CR4_ENABLE_PAE | Cr4::CR4_ENABLE_SSE | Cr4::CR4_UNMASKED_SSE).bits() as u64;
-    sregs.cr0 = (Cr0::CR0_PROTECTED_MODE
-        | Cr0::CR0_MONITOR_COPROCESSOR
-        | Cr0::CR0_EXTENSION_TYPE
-        | Cr0::CR0_NUMERIC_ERROR
-        | Cr0::CR0_WRITE_PROTECT
-        | Cr0::CR0_ALIGNMENT_MASK
-        | Cr0::CR0_ENABLE_PAGING)
-        .bits() as u64;
-    vcpu.set_sregs(&sregs).unwrap();
 }
 
 fn setup_page_tables(memory_arena: *mut u64) {
@@ -208,20 +151,14 @@ fn setup_page_tables(memory_arena: *mut u64) {
     }
 }
 
-fn get_and_clear_dirty_pages(memory_size: usize, vm: &VmFd) -> Vec<u64> {
-    vm.get_dirty_log(GUEST_PFN_BASE as u64, memory_size, 0b100)
-        .unwrap()
-}
-
 fn get_guest_binary_entrypoint_offset(code: &[u8]) -> usize {
-    goblin::pe::PE::parse(code).unwrap().entry
-}
-
-fn create_vm() -> (VmFd, VcpuFd) {
-    let mshv = Mshv::new().unwrap();
-    let pr = Default::default();
-    let vm = mshv.create_vm_with_config(&pr).unwrap();
-    vm.enable_dirty_page_tracking().unwrap();
-    let vcpu = vm.create_vcpu(0).unwrap();
-    (vm, vcpu)
+    let elf = goblin::elf::Elf::parse(code).unwrap();
+    let entry = elf.entry;
+    let offset = elf
+        .program_headers
+        .iter()
+        .find(|ph| ph.p_vaddr <= entry && entry < ph.p_vaddr + ph.p_memsz)
+        .map(|ph| entry - ph.p_vaddr + ph.p_offset)
+        .unwrap();
+    offset as usize
 }

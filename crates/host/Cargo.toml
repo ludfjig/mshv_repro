@@ -9,9 +9,13 @@ mshv-ioctls = {git = "https://github.com/rust-vmm/mshv.git",  tag = "v0.2.0"}
 libc = { version = "0.2.148" }
 x86 = "0.52.0"
 goblin = { version = "0.8" }
+kvm-bindings = "0.11.1"
+kvm-ioctls = "0.21.0"
 
 [features]
-bug = [] # manifests bug
+default = ["kvm"]
+kvm = []
+mshv = []
 
 [profile.release]
 debug = true
