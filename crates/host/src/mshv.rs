@@ -12,7 +12,7 @@ use x86::controlregs::{Cr0, Cr4};
 
 use crate::{shared::InterruptHandle, Registers, Vm, EFER_LMA, EFER_LME, GUEST_PHYSICAL_ADDR_BASE};
 
-struct MshvVm {
+pub(crate) struct MshvVm {
     vm: mshv_ioctls::VmFd,
     vcpu: mshv_ioctls::VcpuFd,
     tid: Arc<AtomicU64>, // the thread the most recent `run` was called
@@ -139,7 +139,7 @@ impl Vm for MshvVm {
     }
 }
 
-fn create_vm() -> MshvVm {
+pub(crate) fn create_vm() -> MshvVm {
     let mshv = Mshv::new().unwrap();
     let pr = Default::default();
     let vm = mshv.create_vm_with_config(&pr).unwrap();
@@ -153,7 +153,7 @@ fn create_vm() -> MshvVm {
     }
 }
 
-fn setup_initial_sregs_mshv(vcpu: &mut impl Vm) {
+pub(crate) fn setup_initial_sregs_mshv(vcpu: &mut impl Vm) {
     let mut sregs = vcpu.sregs_mshv();
     sregs.cs.base = 0;
     sregs.cs.l = 1;

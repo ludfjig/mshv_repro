@@ -13,7 +13,7 @@ pub unsafe extern "C" fn entrypoint(output_ptr: u64) -> ! {
 
 #[no_mangle]
 pub unsafe extern "C" fn dispatch_function() -> ! {
-    let _dirty = 11; // the stack will be dirtied because this value will be written to stack (in debug mode). It is optimized away in release mode
+    loop {}
     asm!("hlt");
     unreachable!()
 }

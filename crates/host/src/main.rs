@@ -8,6 +8,8 @@ mod shared;
 use kvm::setup_initial_sregs_kvm;
 use libc::mmap;
 
+use mshv::setup_initial_sregs_mshv;
+use mshv_bindings::{HV_MAP_GPA_EXECUTABLE, HV_MAP_GPA_READABLE, HV_MAP_GPA_WRITABLE};
 use shared::{Registers, Vm};
 use x86::bits64::paging::{PAddr, PDEntry, PDFlags, PDPTEntry, PDPTFlags, PML4Entry, PML4Flags};
 
@@ -29,16 +31,22 @@ fn main() {
     let memory_arena_raw = setup_memory_arena(memory_size);
     setup_page_tables(memory_arena_raw as *mut u64);
 
-    // create vm and vcpu
-    let mut vm = kvm::create_vm();
-    setup_initial_sregs_kvm(&mut vm);
-
-    vm.map_memory_kvm(kvm_bindings::kvm_userspace_memory_region {
-        slot: 0,
-        flags: 0,
-        guest_phys_addr: 0x200_000,
-        memory_size: memory_size as u64,
+    // let mut vm = kvm::create_vm();
+    // setup_initial_sregs_kvm(&mut vm);
+    // vm.map_memory_kvm(kvm_bindings::kvm_userspace_memory_region {
+    //     slot: 0,
+    //     flags: 0,
+    //     guest_phys_addr: 0x200_000,
+    //     memory_size: memory_size as u64,
+    //     userspace_addr: memory_arena_raw as u64,
+    // });
+    let mut vm = mshv::create_vm();
+    setup_initial_sregs_mshv(&mut vm);
+    vm.map_memory_mshv(mshv_bindings::mshv_user_mem_region {
+        size: memory_size as u64,
+        guest_pfn: GUEST_PFN_BASE as u64,
         userspace_addr: memory_arena_raw as u64,
+        flags: HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE | HV_MAP_GPA_EXECUTABLE,
     });
 
     // write guest binary to memory
