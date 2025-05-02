@@ -31,19 +31,17 @@ fn main() {
     let memory_arena_raw = setup_memory_arena(memory_size);
     setup_page_tables(memory_arena_raw as *mut u64);
 
-    // Uncomment for KVM instead of MSHV
-
-    // let mut vm = kvm::create_vm();
-    // setup_initial_sregs_kvm(&mut vm);
-    // vm.map_memory_kvm(kvm_bindings::kvm_userspace_memory_region {
-    //     slot: 0,
-    //     flags: 0,
-    //     guest_phys_addr: 0x200_000,
-    //     memory_size: memory_size as u64,
-    //     userspace_addr: memory_arena_raw as u64,
-    // });
+    #[cfg(feature = "kvm")]
+    let mut vm = kvm::create_vm();
+    #[cfg(feature = "mshv")]
     let mut vm = mshv::create_vm();
+
+    #[cfg(feature = "kvm")]
+    setup_initial_sregs_kvm(&mut vm);
+    #[cfg(feature = "mshv")]
     setup_initial_sregs_mshv(&mut vm);
+
+    #[cfg(feature = "mshv")]
     vm.map_memory_mshv(mshv_bindings::mshv_user_mem_region {
         size: memory_size as u64,
         guest_pfn: GUEST_PFN_BASE as u64,
@@ -51,10 +49,20 @@ fn main() {
         flags: HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE | HV_MAP_GPA_EXECUTABLE,
     });
 
+    #[cfg(feature = "kvm")]
+    vm.map_memory_kvm(kvm_bindings::kvm_userspace_memory_region {
+        slot: 0,
+        flags: 0,
+        guest_phys_addr: 0x200_000,
+        memory_size: memory_size as u64,
+        userspace_addr: memory_arena_raw as u64,
+    });
+
     run_guest_entrypoint(&mut vm, memory_arena_raw, memory_size);
 
     extern "C" fn handle_sigusr1(_: libc::c_int) {
-        // do nothing. Default is to kill the process
+        // do nothing. This is enough to interrupt blocking `run()` call to vm.
+        // Default is to kill the process which is undesirable.
     }
     unsafe {
         libc::signal(libc::SIGUSR1, handle_sigusr1 as usize);
@@ -162,4 +170,12 @@ fn run_guest_entrypoint(vm: &mut impl Vm, memory_arena_raw: *mut u8, memory_size
     regs.rsp = (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64;
     regs.rflags = 0x2;
     vm.set_regs(&regs);
+}
+
+#[allow(dead_code)]
+fn compile_error() {
+    #[cfg(not(any(feature = "kvm", feature = "mshv")))]
+    compile_error!("Please enable either kvm or mshv feature");
+    #[cfg(all(feature = "kvm", feature = "mshv"))]
+    compile_error!("Please enable only one of kvm or mshv feature");
 }

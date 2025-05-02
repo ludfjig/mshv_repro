@@ -16,12 +16,12 @@ use crate::{
 pub struct KvmVm {
     vm: kvm_ioctls::VmFd,
     vcpu: kvm_ioctls::VcpuFd,
-    tid: Arc<AtomicU64>, // the thread the most recent `run` was called
-    is_running: Arc<AtomicBool>,
+    tid: Arc<AtomicU64>,         // the thread the most recent `run` was called
+    is_running: Arc<AtomicBool>, // set to true while the vcpu is running (blocking)
 }
 
 pub fn create_vm() -> KvmVm {
-    let kvm = kvm_ioctls::Kvm::new().unwrap();
+    let kvm = kvm_ioctls::Kvm::new().expect("unable to open /dev/kvm, are you running on mshv?");
     let vm = kvm.create_vm().unwrap();
     let vcpu = vm.create_vcpu(0).unwrap();
     KvmVm {

@@ -18,6 +18,21 @@ pub(crate) struct MshvVm {
     tid: Arc<AtomicU64>, // the thread the most recent `run` was called
     is_running: Arc<AtomicBool>,
 }
+
+pub(crate) fn create_vm() -> MshvVm {
+    let mshv = Mshv::new().expect("unable to open /dev/mshv, are you running on kvm?");
+    let pr = Default::default();
+    let vm = mshv.create_vm_with_config(&pr).unwrap();
+    vm.enable_dirty_page_tracking().unwrap();
+    let vcpu = vm.create_vcpu(0).unwrap();
+    MshvVm {
+        vm,
+        vcpu,
+        tid: Arc::new(AtomicU64::new(0)),
+        is_running: Arc::new(AtomicBool::new(false)),
+    }
+}
+
 impl Vm for MshvVm {
     fn regs(&self) -> Registers {
         let regs = self.vcpu.get_regs().unwrap();
@@ -136,20 +151,6 @@ impl Vm for MshvVm {
 
     fn map_memory_kvm(&self, _region: kvm_bindings::kvm_userspace_memory_region) {
         todo!()
-    }
-}
-
-pub(crate) fn create_vm() -> MshvVm {
-    let mshv = Mshv::new().unwrap();
-    let pr = Default::default();
-    let vm = mshv.create_vm_with_config(&pr).unwrap();
-    vm.enable_dirty_page_tracking().unwrap();
-    let vcpu = vm.create_vcpu(0).unwrap();
-    MshvVm {
-        vm,
-        vcpu,
-        tid: Arc::new(AtomicU64::new(0)),
-        is_running: Arc::new(AtomicBool::new(false)),
     }
 }
 
