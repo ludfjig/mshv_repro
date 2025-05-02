@@ -12,10 +12,6 @@ goblin = { version = "0.8" }
 kvm-bindings = "0.11.1"
 kvm-ioctls = "0.21.0"
 
-[features]
-default = ["kvm"]
-kvm = []
-mshv = []
 
 [profile.release]
 debug = true

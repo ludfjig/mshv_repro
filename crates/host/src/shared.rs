@@ -1,30 +1,51 @@
-use kvm_bindings::{kvm_sregs, kvm_userspace_memory_region, kvm_userspace_memory_region2};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+
+use kvm_bindings::{kvm_sregs, kvm_userspace_memory_region};
+use libc::SIGUSR1;
+use mshv_bindings::{mshv_user_mem_region, SpecialRegisters};
 
 pub(crate) trait Vm: Send + Sync {
     fn regs(&self) -> Registers;
     fn set_regs(&self, regs: &Registers);
-    fn sregs(&self) -> kvm_sregs;
-    fn set_sregs(&self, sregs: &kvm_sregs);
 
-    fn map_memory(&self, region: kvm_userspace_memory_region);
+    // unify these
+    fn sregs_kvm(&self) -> kvm_sregs;
+    fn sregs_mshv(&self) -> SpecialRegisters;
 
-    fn run(&mut self);
+    // unify these
+    fn set_sregs_kvm(&self, sregs: &kvm_sregs);
+    fn set_sregs_mshv(&self, sregs: &SpecialRegisters);
+
+    // TODO unify these
+    fn map_memory_kvm(&self, region: kvm_userspace_memory_region);
+    fn map_memory_mshv(&self, region: mshv_user_mem_region);
+
+    fn run_until_halt_or_err(&mut self);
 
     fn interrupt_handle(&self) -> InterruptHandle;
-
-    fn kill(&self) -> Result<(), ()>;
 }
 
 pub(crate) struct InterruptHandle {
-    pub(crate) vm: *const dyn Vm,
+    pub(crate) tid: Arc<AtomicU64>,
+    pub(crate) is_running: Arc<AtomicBool>,
 }
 
 unsafe impl Send for InterruptHandle {}
 unsafe impl Sync for InterruptHandle {}
 
 impl InterruptHandle {
-    pub(crate) fn kill(&self) -> Result<(), ()> {
-        unsafe { self.vm.as_ref().unwrap().kill() }
+    pub(crate) fn interrupt_vm_if_running(&self) {
+        println!("Interrupting VM...");
+        if self.is_running.load(Ordering::Relaxed) {
+            println!("Sending SIGUSR1 to thread on which VM is running...");
+            // will cause blocking run call to exit with EINTR
+            unsafe { libc::pthread_kill(self.tid.load(Ordering::Relaxed), SIGUSR1) };
+        } else {
+            println!("VM was not running, not interrupting..");
+        }
     }
 }
 

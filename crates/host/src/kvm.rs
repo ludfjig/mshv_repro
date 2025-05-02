@@ -1,6 +1,11 @@
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
+
 use kvm_bindings::{kvm_regs, kvm_sregs};
 use kvm_ioctls::VcpuExit;
-use libc::SIGUSR1;
+use mshv_bindings::SpecialRegisters;
 use x86::controlregs::{Cr0, Cr4};
 
 use crate::{
@@ -8,7 +13,13 @@ use crate::{
     EFER_LMA, EFER_LME, GUEST_PHYSICAL_ADDR_BASE,
 };
 
-#[cfg(feature = "kvm")]
+pub struct KvmVm {
+    vm: kvm_ioctls::VmFd,
+    vcpu: kvm_ioctls::VcpuFd,
+    tid: Arc<AtomicU64>, // the thread the most recent `run` was called
+    is_running: Arc<AtomicBool>,
+}
+
 pub fn create_vm() -> KvmVm {
     let kvm = kvm_ioctls::Kvm::new().unwrap();
     let vm = kvm.create_vm().unwrap();
@@ -16,14 +27,9 @@ pub fn create_vm() -> KvmVm {
     KvmVm {
         vm,
         vcpu,
-        tid: None,
+        tid: Arc::new(AtomicU64::new(0)),
+        is_running: Arc::new(AtomicBool::new(false)),
     }
-}
-
-pub struct KvmVm {
-    vm: kvm_ioctls::VmFd,
-    vcpu: kvm_ioctls::VcpuFd,
-    tid: Option<u64>, // the thread the most recent `run` was called
 }
 
 impl Vm for KvmVm {
@@ -75,15 +81,15 @@ impl Vm for KvmVm {
         self.vcpu.set_regs(&kvm_regs).unwrap();
     }
 
-    fn sregs(&self) -> kvm_sregs {
+    fn sregs_kvm(&self) -> kvm_sregs {
         self.vcpu.get_sregs().unwrap()
     }
 
-    fn set_sregs(&self, sregs: &kvm_sregs) {
+    fn set_sregs_kvm(&self, sregs: &kvm_sregs) {
         self.vcpu.set_sregs(sregs).unwrap();
     }
 
-    fn map_memory(&self, region: kvm_bindings::kvm_userspace_memory_region) {
+    fn map_memory_kvm(&self, region: kvm_bindings::kvm_userspace_memory_region) {
         unsafe {
             self.vm
                 .set_user_memory_region(region)
@@ -91,12 +97,18 @@ impl Vm for KvmVm {
         }
     }
 
-    fn run(&mut self) {
-        // Run CPU until halt
-
+    fn run_until_halt_or_err(&mut self) {
         loop {
-            self.tid.replace(unsafe { libc::pthread_self() });
-            match self.vcpu.run() {
+            self.tid
+                .store(unsafe { libc::pthread_self() }, Ordering::Relaxed);
+            self.is_running.store(true, Ordering::Relaxed);
+
+            match self
+                .vcpu
+                .run()
+                .inspect(|_| self.is_running.store(false, Ordering::Relaxed))
+                .inspect_err(|_| self.is_running.store(false, Ordering::Relaxed))
+            {
                 Ok(m) => match m {
                     VcpuExit::IoOut(port, data) => {
                         println!("io port intercept on port {}, with value: {:?}", port, data);
@@ -111,7 +123,11 @@ impl Vm for KvmVm {
                     }
                 },
                 Err(e) => {
-                    println!("Unknown exit: Error: {:?}", e);
+                    if e.errno() == libc::EINTR {
+                        println!("Vcpu interrupted");
+                    } else {
+                        println!("Unknown vcpu exit: Error: {:?}", e);
+                    }
                     break;
                 }
             }
@@ -119,18 +135,27 @@ impl Vm for KvmVm {
     }
 
     fn interrupt_handle(&self) -> InterruptHandle {
-        InterruptHandle { vm: self }
+        InterruptHandle {
+            tid: self.tid.clone(),
+            is_running: self.is_running.clone(),
+        }
     }
 
-    fn kill(&self) -> Result<(), ()> {
-        println!("Sending SIGUSR1 to thread on which VM is running...");
-        unsafe { libc::pthread_kill(self.tid.unwrap(), SIGUSR1) };
-        Ok(())
+    fn map_memory_mshv(&self, _region: mshv_bindings::mshv_user_mem_region) {
+        panic!("called mshv on kvm struct")
+    }
+
+    fn sregs_mshv(&self) -> SpecialRegisters {
+        panic!("called mshv on kvm struct")
+    }
+
+    fn set_sregs_mshv(&self, sregs: &mshv_bindings::SpecialRegisters) {
+        panic!("called mshv on kvm struct")
     }
 }
 
-pub(crate) fn setup_initial_sregs(vm: &mut dyn Vm) {
-    let mut sregs = vm.sregs();
+pub(crate) fn setup_initial_sregs_kvm(vm: &mut impl Vm) {
+    let mut sregs = vm.sregs_kvm();
     sregs.cs.base = 0;
     sregs.cs.l = 1;
     sregs.cs.s = 1;
@@ -148,5 +173,5 @@ pub(crate) fn setup_initial_sregs(vm: &mut dyn Vm) {
         | Cr0::CR0_ALIGNMENT_MASK
         | Cr0::CR0_ENABLE_PAGING)
         .bits() as u64;
-    vm.set_sregs(&sregs);
+    vm.set_sregs_kvm(&sregs);
 }

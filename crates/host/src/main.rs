@@ -1,27 +1,15 @@
-use std::alloc::Layout;
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
-use std::{thread, vec};
 
 mod kvm;
+mod mshv;
 mod shared;
 
-use kvm::{create_vm, setup_initial_sregs};
-use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
-use libc::{mmap, munmap, SIGUSR1};
-use mshv_bindings::{
-    hv_message, hv_message_type_HVMSG_UNMAPPED_GPA, hv_message_type_HVMSG_UNRECOVERABLE_EXCEPTION,
-    hv_message_type_HVMSG_X64_HALT, hv_message_type_HVMSG_X64_IO_PORT_INTERCEPT,
-    mshv_user_mem_region, StandardRegisters, HV_MAP_GPA_EXECUTABLE, HV_MAP_GPA_READABLE,
-    HV_MAP_GPA_WRITABLE,
-};
-use mshv_ioctls::{Mshv, VcpuFd, VmFd};
+use kvm::setup_initial_sregs_kvm;
+use libc::mmap;
+
 use shared::{Registers, Vm};
 use x86::bits64::paging::{PAddr, PDEntry, PDFlags, PDPTEntry, PDPTFlags, PML4Entry, PML4Flags};
-use x86::controlregs::Cr0;
-use x86::controlregs::Cr4;
 
 const PAGE_SHIFT: usize = 12;
 const PAGE_SIZE: usize = 1 << PAGE_SHIFT; // 4KB
@@ -42,10 +30,10 @@ fn main() {
     setup_page_tables(memory_arena_raw as *mut u64);
 
     // create vm and vcpu
-    let mut vm = create_vm();
-    setup_initial_sregs(&mut vm as &mut dyn Vm);
+    let mut vm = kvm::create_vm();
+    setup_initial_sregs_kvm(&mut vm);
 
-    vm.map_memory(kvm_bindings::kvm_userspace_memory_region {
+    vm.map_memory_kvm(kvm_bindings::kvm_userspace_memory_region {
         slot: 0,
         flags: 0,
         guest_phys_addr: 0x200_000,
@@ -74,7 +62,7 @@ fn main() {
         ..Default::default()
     };
     vm.set_regs(&regs);
-    vm.run();
+    vm.run_until_halt_or_err();
 
     // get result from entrypoint fn (written to output buffer)
     let dispatch_fn_addr = unsafe { (memory_arena_raw.byte_add(output_offset) as *mut u64).read() };
@@ -89,23 +77,23 @@ fn main() {
     unsafe {
         libc::signal(libc::SIGUSR1, handle_sigusr1 as usize);
     }
-    let handle = vm.interrupt_handle();
+    let interrupt_handle = vm.interrupt_handle();
 
     // Kill the blocking vm after 3 secs
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(3));
-        handle.kill().unwrap();
+        interrupt_handle.interrupt_vm_if_running();
     });
 
     // runs forever
     println!("Entering infinite loop in guest...");
-    vm.run();
+    vm.run_until_halt_or_err();
 
     println!("IT WORKED");
 }
 
 extern "C" fn handle_sigusr1(_: libc::c_int) {
-    println!("Received SIGUSR1!");
+    // do nothing
 }
 
 fn setup_memory_arena(memory_size: usize) -> *mut u8 {
