@@ -31,6 +31,8 @@ fn main() {
     let memory_arena_raw = setup_memory_arena(memory_size);
     setup_page_tables(memory_arena_raw as *mut u64);
 
+    // Uncomment for KVM instead of MSHV
+
     // let mut vm = kvm::create_vm();
     // setup_initial_sregs_kvm(&mut vm);
     // vm.map_memory_kvm(kvm_bindings::kvm_userspace_memory_region {
@@ -49,39 +51,11 @@ fn main() {
         flags: HV_MAP_GPA_READABLE | HV_MAP_GPA_WRITABLE | HV_MAP_GPA_EXECUTABLE,
     });
 
-    // write guest binary to memory
-    let code = include_bytes!("../../guest/target/x86_64-unknown-none/debug/guest");
-    let entrypoint_offset = get_guest_binary_entrypoint_offset(code);
-    unsafe {
-        std::ptr::copy(
-            code.as_ptr(),
-            memory_arena_raw.byte_add(CODE_OFFSET),
-            code.len(),
-        );
+    run_guest_entrypoint(&mut vm, memory_arena_raw, memory_size);
+
+    extern "C" fn handle_sigusr1(_: libc::c_int) {
+        // do nothing. Default is to kill the process
     }
-    let output_offset = (CODE_OFFSET + code.len()).next_multiple_of(PAGE_SIZE);
-
-    // Run entrypoint fn in guest
-    let regs = Registers {
-        rip: (GUEST_PHYSICAL_ADDR_BASE + CODE_OFFSET + entrypoint_offset) as u64,
-        rsp: (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64,
-        rdi: (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64, // first parameter output buffer
-        rflags: 0x2,
-        ..Default::default()
-    };
-    vm.set_regs(&regs);
-    vm.run_until_halt_or_err();
-
-    // get result from entrypoint fn (written to output buffer)
-    let dispatch_fn_addr = unsafe { (memory_arena_raw.byte_add(output_offset) as *mut u64).read() };
-
-    // set regs
-    let mut regs = vm.regs();
-    regs.rip = dispatch_fn_addr;
-    regs.rsp = (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64;
-    regs.rflags = 0x2;
-    vm.set_regs(&regs);
-
     unsafe {
         libc::signal(libc::SIGUSR1, handle_sigusr1 as usize);
     }
@@ -97,11 +71,7 @@ fn main() {
     println!("Entering infinite loop in guest...");
     vm.run_until_halt_or_err();
 
-    println!("IT WORKED");
-}
-
-extern "C" fn handle_sigusr1(_: libc::c_int) {
-    // do nothing
+    println!("Execution continued after guest infinite loop");
 }
 
 fn setup_memory_arena(memory_size: usize) -> *mut u8 {
@@ -157,4 +127,39 @@ fn get_guest_binary_entrypoint_offset(code: &[u8]) -> usize {
         .map(|ph| entry - ph.p_vaddr + ph.p_offset)
         .unwrap();
     offset as usize
+}
+
+fn run_guest_entrypoint(vm: &mut impl Vm, memory_arena_raw: *mut u8, memory_size: usize) {
+    // write guest binary to memory
+    let code = include_bytes!("../../guest/target/x86_64-unknown-none/debug/guest");
+    let entrypoint_offset = get_guest_binary_entrypoint_offset(code);
+    unsafe {
+        std::ptr::copy(
+            code.as_ptr(),
+            memory_arena_raw.byte_add(CODE_OFFSET),
+            code.len(),
+        );
+    }
+    let output_offset = (CODE_OFFSET + code.len()).next_multiple_of(PAGE_SIZE);
+
+    // Run entrypoint fn in guest
+    let regs = Registers {
+        rip: (GUEST_PHYSICAL_ADDR_BASE + CODE_OFFSET + entrypoint_offset) as u64,
+        rsp: (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64,
+        rdi: (GUEST_PHYSICAL_ADDR_BASE + output_offset) as u64, // first parameter output buffer
+        rflags: 0x2,
+        ..Default::default()
+    };
+    vm.set_regs(&regs);
+    vm.run_until_halt_or_err();
+
+    // get result from entrypoint fn (written to output buffer)
+    let dispatch_fn_addr = unsafe { (memory_arena_raw.byte_add(output_offset) as *mut u64).read() };
+
+    // set regs
+    let mut regs = vm.regs();
+    regs.rip = dispatch_fn_addr;
+    regs.rsp = (GUEST_PHYSICAL_ADDR_BASE + memory_size - 0x28) as u64;
+    regs.rflags = 0x2;
+    vm.set_regs(&regs);
 }
